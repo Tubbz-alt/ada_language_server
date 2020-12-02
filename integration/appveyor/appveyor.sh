@@ -6,6 +6,7 @@ set -e -x
 export BUILD_FOLDER=/Projects/ada-language-server
 export ADALIB_DIR=$BUILD_FOLDER/adalib
 export PATH=$ADALIB_DIR/bin:\
+$BUILD_FOLDER/.libs/spawn/relocatable:\
 /c/GNAT/bin:\
 /mingw64/bin:\
 $PATH
