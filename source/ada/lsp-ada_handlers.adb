@@ -50,6 +50,7 @@ with Langkit_Support.Text;
 with Laltools.Call_Hierarchy;
 with Laltools.Common;
 with Laltools.Refactor_Imports;
+with Laltools.Refactor.Rename;
 
 with Libadalang.Analysis;
 with Libadalang.Common;    use Libadalang.Common;
@@ -2647,48 +2648,65 @@ package body LSP.Ada_Handlers is
       Document  : constant LSP.Ada_Documents.Document_Access :=
                    Get_Open_Document (Self, Value.textDocument.uri);
 
+      Refs      : Laltools.Refactor.Rename.Renamable_References;
+
       procedure Process_Context (C : Context_Access);
       --  Process the rename request for the given context, and add
-      --  the results to response.
+      --  the results to response. If a rename problem is found, return a
+      --  response with an error.
 
       ---------------------
       -- Process_Context --
       ---------------------
 
       procedure Process_Context (C : Context_Access) is
-         Position : constant LSP.Messages.TextDocumentPositionParams :=
-                      (Value.textDocument, Value.position);
+         Position   : constant LSP.Messages.TextDocumentPositionParams :=
+           (Value.textDocument, Value.position);
 
-         Name_Node  : constant Name := Laltools.Common.Get_Node_As_Name
+         Node      : Ada_Node := C.Get_Node_At (Document, Position);
+         Name_Node : Name := Laltools.Common.Get_Node_As_Name
            (C.Get_Node_At (Document, Position));
 
-         Definition : Defining_Name;
-         Imprecise  : Boolean;
-         Empty      : LSP.Messages.TextEdit_Vector;
-         Count      : Cancel_Countdown := 0;
+         Empty     : LSP.Messages.TextEdit_Vector;
+
+         --  Analysis unit of the reference that is being added to Response.
+         Unit      : Analysis_Unit;
 
          procedure Process_Comments
            (Node : Ada_Node;
             Uri  : LSP.Messages.DocumentUri);
          --  Iterate over all comments and include them in the response when
-         --  they contain a renamed word
+         --  they contain a renamed word.
 
-         procedure Callback
-           (Node   : Libadalang.Analysis.Base_Id;
-            Kind   : Libadalang.Common.Ref_Result_Kind;
-            Cancel : in out Boolean);
+         procedure Process_Reference
+           (Unit_Filename : String;
+            Sloc_Range    : Langkit_Support.Slocs.Source_Location_Range);
+         --  Add a reference to Response if it has not been added yet.
 
-         --------------
-         -- Callback --
-         --------------
+         -----------------------
+         -- Process_Reference --
+         -----------------------
 
-         procedure Callback
-           (Node   : Libadalang.Analysis.Base_Id;
-            Kind   : Libadalang.Common.Ref_Result_Kind;
-            Cancel : in out Boolean)
+         procedure Process_Reference
+           (Unit_Filename : String;
+            Sloc_Range    : Langkit_Support.Slocs.Source_Location_Range)
          is
+            use type VSS.Unicode.UTF16_Code_Unit_Count;
+
             Location : constant LSP.Messages.Location :=
-              Get_Node_Location (Node.As_Ada_Node);
+              (uri     => LSP.Ada_Contexts.File_To_URI
+                 (To_Unbounded_Wide_String
+                      (To_Wide_String (Unit_Filename))),
+               span    => LSP.Messages.Span'
+                 (first => LSP.Messages.Position'
+                      (line      => Line_Number (Sloc_Range.Start_Line) - 1,
+                       character => LSP.Types.UTF_16_Index
+                         (Sloc_Range.Start_Column) - 1),
+                  last  => LSP.Messages.Position'
+                    (line      => Line_Number (Sloc_Range.End_Line) - 1,
+                     character => LSP.Types.UTF_16_Index
+                       (Sloc_Range.End_Column) - 1)),
+               alsKind => <>);
             Item     : constant LSP.Messages.TextEdit :=
               (span    => Location.span,
                newText => Value.newName);
@@ -2696,11 +2714,16 @@ package body LSP.Ada_Handlers is
             if not Response.result.changes.Contains (Location.uri) then
                --  We haven't touched this document yet, create an empty
                --  change list
-               Response.result.changes.Insert (Location.uri, Empty);
+               Response.result.changes.Insert
+                 (Location.uri, Empty);
 
                --  Process comments if it is needed
+
                if Self.Options.Refactoring.Renaming.In_Comments then
-                  Process_Comments (Node.As_Ada_Node, Location.uri);
+                  Process_Comments
+                    (Unit.Root.Lookup
+                       ((Sloc_Range.Start_Line, Sloc_Range.Start_Column)),
+                     Location.uri);
                end if;
             end if;
 
@@ -2708,20 +2731,13 @@ package body LSP.Ada_Handlers is
             --  projects), it's possible to encounter the same
             --  definitions more than once, so verify that the result
             --  is not already recorded before adding it.
+
             if not Response.result.changes
               (Location.uri).Contains (Item)
             then
                Response.result.changes (Location.uri).Append (Item);
             end if;
-
-            Cancel := Count = 0 and then Request.Canceled;
-
-            Count := Count - 1;
-
-            if Kind = Libadalang.Common.Imprecise then
-               Imprecise := True;
-            end if;
-         end Callback;
+         end Process_Reference;
 
          -----------------------
          --  Process_Comments --
@@ -2874,45 +2890,80 @@ package body LSP.Ada_Handlers is
             end loop;
          end Process_Comments;
 
+         use Laltools.Refactor.Rename;
+
+         Cursor_1 : Unit_Slocs_Maps.Cursor;
+         Cursor_2 : Slocs_Maps.Cursor;
+
+         use Unit_Slocs_Maps;
+         use Slocs_Maps;
       begin
-         if Name_Node = No_Name then
+
+         Refs := Find_All_Renamable_References
+           (Node           => Node,
+            New_Name       => To_Unbounded_Text_Type (Value.newName),
+            Units          => C.Analysis_Units,
+            Algorithm_Kind => Analyse_AST);
+
+         --  Call to Find_All_Renamable_References above reparses all analysis
+         --  units, therefore, Node and Name_Node need to be recomputed.
+
+         Node := C.Get_Node_At (Document, Position);
+         Name_Node := Laltools.Common.Get_Node_As_Name
+           (C.Get_Node_At (Document, Position));
+
+         --  If problems were found, do not continue processing references.
+         if not Refs.Problems.Is_Empty then
             return;
          end if;
 
-         Definition := Laltools.Common.Resolve_Name
-           (Name_Node,
-            Self.Trace,
-            Imprecise => Imprecise);
-
-         --  If we used the imprecise fallback to get to the definition, stop
-         if Imprecise then
-            return;
-         end if;
-
-         if Definition = No_Defining_Name or Request.Canceled then
-            return;
-         end if;
-
-         C.Get_References_For_Renaming
-           (Definition        => Definition,
-            Imprecise_Results => Imprecise,
-            Callback          => Callback'Access);
-
-         if Imprecise then
-            Self.Show_Message
-              ("References are not precise: renamed cancelled",
-               LSP.Messages.Warning);
-            return;
-         end if;
-
+         Cursor_1 := Refs.References.First;
+         while Has_Element (Cursor_1) loop
+            Unit := Key (Cursor_1);
+            Cursor_2 := Refs.References.Constant_Reference (Cursor_1).First;
+            while Has_Element (Cursor_2) loop
+               for Sloc of
+                 Refs.References.Constant_Reference (Cursor_1).
+                 Constant_Reference (Cursor_2)
+               loop
+                  Process_Reference (Key (Cursor_1).Get_Filename, Sloc);
+               end loop;
+               Next (Cursor_2);
+            end loop;
+            Next (Cursor_1);
+         end loop;
       end Process_Context;
 
    begin
       for C of Self.Contexts_For_URI (Value.textDocument.uri) loop
          Process_Context (C);
 
+         --  If problems were found, send an error message and do not proceed
+         --  with the renames.
+
+         if not Refs.Problems.Is_Empty then
+            return Response : LSP.Messages.Server_Responses.Rename_Response
+              (Is_Error => True)
+            do
+               declare
+                  Error_Message : Unbounded_String;
+               begin
+                  for Problem of Refs.Problems loop
+                     Error_Message := Error_Message
+                       & To_Unbounded_String (Problem.Info & ASCII.LF);
+                  end loop;
+                  Response.error :=
+                    (True,
+                     (code => LSP.Errors.InvalidRequest,
+                      message => +(To_String (Error_Message)),
+                      data    => Empty));
+               end;
+            end return;
+         end if;
+
          exit when Request.Canceled;
       end loop;
+
       return Response;
    end On_Rename_Request;
 

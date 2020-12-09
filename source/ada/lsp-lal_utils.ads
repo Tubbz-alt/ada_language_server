@@ -27,6 +27,7 @@ with Libadalang.Analysis;  use Libadalang.Analysis;
 with Libadalang.Common;
 
 with Langkit_Support.Slocs;
+with Langkit_Support.Text;
 
 with VSS.Strings;
 
@@ -113,6 +114,11 @@ package LSP.Lal_Utils is
      (Name : Libadalang.Analysis.Defining_Name)
       return LSP.Messages.CallHierarchyItem;
    --  Create CallHierarchyItem for the given subprogram
+
+   function To_Unbounded_Text_Type
+     (Item : LSP.Types.LSP_String)
+      return Langkit_Support.Text.Unbounded_Text_Type;
+   --  Converts LSP_String to Text_Type.
 
    function Node_Location_Image
      (Node : Libadalang.Analysis.Ada_Node'Class) return LSP.Types.LSP_String;
